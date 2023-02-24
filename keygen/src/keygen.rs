@@ -1,4 +1,6 @@
 #![allow(clippy::integer_arithmetic)]
+
+use solana_remote_keypair::openpgp_card::OpenpgpCard;
 use {
     bip39::{Language, Mnemonic, MnemonicType, Seed},
     clap::{crate_description, crate_name, Arg, ArgMatches, Command},
@@ -6,12 +8,15 @@ use {
         input_parsers::STDOUT_OUTFILE_TOKEN,
         input_validators::{is_parsable, is_prompt_signer_source},
         keypair::{
-            keypair_from_path, keypair_from_seed_phrase, prompt_passphrase, signer_from_path,
+            keypair_from_path, keypair_from_seed_phrase, prompt_passphrase,
+            parse_signer_source, signer_from_path,
             SKIP_SEED_PHRASE_VALIDATION_ARG,
+            SignerSourceKind
         },
         ArgConstant, DisplayError,
     },
     solana_cli_config::{Config, CONFIG_FILE},
+    solana_remote_keypair::openpgp_card::Locator as OpenpgpCardLocator,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_sdk::{
         derivation_path::DerivationPath,
@@ -124,10 +129,19 @@ impl KeyGenerationCommonArgs for Command<'_> {
     }
 }
 
-fn check_for_overwrite(outfile: &str, matches: &ArgMatches) {
+fn check_file_for_overwrite(outfile: &str, matches: &ArgMatches) {
     let force = matches.is_present("force");
     if !force && Path::new(outfile).exists() {
         eprintln!("Refusing to overwrite {outfile} without --force flag");
+        exit(1);
+    }
+}
+
+fn check_pgpcard_for_overwrite(locator: &OpenpgpCardLocator, matches: &ArgMatches) {
+    let force = matches.is_present("force");
+    let card = OpenpgpCard::from(locator);
+    if !force && card.has_signing_key() {
+        eprintln!("Refusing to overwrite signing key on card {} without --force flag", card.aid());
         exit(1);
     }
 }
@@ -154,12 +168,20 @@ fn output_keypair(
     outfile: &str,
     source: &str,
 ) -> Result<(), Box<dyn error::Error>> {
-    if outfile == STDOUT_OUTFILE_TOKEN {
-        let mut stdout = std::io::stdout();
-        write_keypair(keypair, &mut stdout)?;
-    } else {
-        write_keypair_file(keypair, outfile)?;
-        println!("Wrote {source} keypair to {outfile}");
+    let keypair_kind = parse_signer_source(outfile.to_string())?.kind;
+    match keypair_kind {
+        SignerSourceKind::Stdin => {  // indicates STDOUT_OUTFILE_TOKEN was received
+            let mut stdout = std::io::stdout();
+            write_keypair(keypair, &mut stdout)?;
+        },
+        SignerSourceKind::Filepath(path) => {
+            write_keypair_file(keypair, path)?;
+            println!("Wrote {source} keypair to {outfile}");
+        },
+        SignerSourceKind::Pgpcard(locator) => {
+            
+        },
+        _ => return Err(format!("output_keypair not implemented for {:?}", keypair_kind).into()),
     }
     Ok(())
 }
@@ -584,7 +606,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
 
             if matches.is_present("outfile") {
                 let outfile = matches.value_of("outfile").unwrap();
-                check_for_overwrite(outfile, matches);
+                check_file_for_overwrite(outfile, matches);
                 write_pubkey_file(outfile, pubkey)?;
             } else {
                 println!("{pubkey}");
@@ -601,10 +623,14 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 Some(path.to_str().unwrap())
             };
 
-            match outfile {
-                Some(STDOUT_OUTFILE_TOKEN) => (),
-                Some(outfile) => check_for_overwrite(outfile, matches),
-                None => (),
+            if let Some(outfile_path) = outfile {
+                let keypair_kind = parse_signer_source(outfile_path.to_string())?.kind;
+                match keypair_kind {
+                    SignerSourceKind::Stdin => (),  // indicates STDOUT_OUTFILE_TOKEN was received
+                    SignerSourceKind::Filepath(path) => check_file_for_overwrite(path.as_str(), matches),
+                    SignerSourceKind::Pgpcard(locator) => check_pgpcard_for_overwrite(&locator, matches),
+                    _ => return Err(format!("keygen not implemented for {:?}", keypair_kind).into()),
+                }
             }
 
             let word_count: usize = matches.value_of_t(WORD_COUNT_ARG.name).unwrap();
@@ -651,7 +677,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             };
 
             if outfile != STDOUT_OUTFILE_TOKEN {
-                check_for_overwrite(outfile, matches);
+                check_file_for_overwrite(outfile, matches);
             }
 
             let keypair_name = "recover";
