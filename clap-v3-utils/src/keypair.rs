@@ -21,7 +21,7 @@ use {
     solana_remote_keypair::openpgp_card::{
         Locator as OpenpgpCardLocator,
         LocatorError as OpenpgpCardLocatorError,
-        OpenpgpCardKeypair
+        OpenpgpCard,
     },
     solana_remote_wallet::{
         locator::{Locator as RemoteWalletLocator, LocatorError as RemoteWalletLocatorError},
@@ -493,7 +493,7 @@ pub fn parse_signer_source<S: AsRef<str>>(
                     }),
                     SIGNER_SOURCE_STDIN => Ok(SignerSource::new(SignerSourceKind::Stdin)),
                     SIGNER_SOURCE_PGPCARD => Ok(SignerSource::new(SignerSourceKind::Pgpcard(
-                        OpenpgpCardLocator::new_from_uri(&uri)?
+                        OpenpgpCardLocator::try_from(&uri)?
                     ))),
                     _ => {
                         #[cfg(target_family = "windows")]
@@ -627,6 +627,20 @@ pub struct SignerFromPathConfig {
 ///   - `usb://ledger?key=0/0`
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd`
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd?key=0/0`
+///
+/// - `pgpcard:` &mdash; Use a connected OpenPGP smart card as the signer.
+///   In particular, use the key in the signing slot of the OpenPGP application
+///   on the card.
+///
+///   The URI host is the 16-byte OpenPGP AID in its standard hexadecimal form
+///   (32 digits). (For details, see section 4.2.1 of the
+///   [OpenPGP specification][pgpspec].) The URI host may also be omitted, in
+///   which case the first connected smart card that is found is used.
+///
+///   Examples:
+///
+///   - `pgpcard://`
+///   - `pgpcard://D2760001240103040006123456780000`
 ///
 /// Next the `path` argument may be one of the following strings:
 ///
@@ -828,7 +842,7 @@ pub fn signer_from_path_with_config(
             }
         }
         SignerSourceKind::Pgpcard(locator) => {
-            Ok(Box::new(OpenpgpCardKeypair::new_from_locator(locator)?))
+            Ok(Box::new(OpenpgpCard::try_from(&locator)?))
         }
     }
 }
