@@ -1,10 +1,12 @@
 use {
+    crate::medium::{RemoteKeypairMedium, RemoteKeypairMediumError},
     openpgp_card::{
-        algorithm::{Algo, Curve},
+        algorithm::{Algo, Curve, EccAttrs},
+        card_do::{ApplicationIdentifier, Fingerprint, KeyGenerationTime, KeyStatus, UIF},
         crypto_data::{EccType, PublicKeyMaterial, Hash},
+        KeyType,
         OpenPgp,
         SmartcardError,
-        card_do::{UIF, ApplicationIdentifier},
         OpenPgpTransaction
     },
     openpgp_card_pcsc::PcscBackend,
@@ -14,7 +16,10 @@ use {
         pubkey::Pubkey,
         signature::{Signature, Signer, SignerError},
     },
-    std::cell::RefCell,
+    std::{
+        cell::RefCell,
+        error,
+    },
     thiserror::Error,
     uriparse::{URIReference, URIReferenceError},
 };
@@ -189,9 +194,13 @@ impl Signer for OpenpgpCard {
         //   * Card indicates PIN is only valid for one PSO:CDS command at a time, or
         //   * PIN has not yet been entered for the first time.
         if card_info.pin_cds_valid_once || !*self.pin_verified.borrow() {
-            let mut pin = get_pin_from_user_as_bytes(&card_info, true)?;
+            let mut pin = get_pin_from_user_as_bytes(&card_info, false, true).map_err(
+                |e| SignerError::Custom(e.to_string())
+            )?;
             while opt.verify_pw1_sign(pin.as_bytes()).is_err() {
-                pin = get_pin_from_user_as_bytes(&card_info, false)?;
+                pin = get_pin_from_user_as_bytes(&card_info, false, false).map_err(
+                    |e| SignerError::Custom(e.to_string())
+                )?;
             }
             *self.pin_verified.borrow_mut() = true;
         }
@@ -216,6 +225,49 @@ impl Signer for OpenpgpCard {
 
     fn is_interactive(&self) -> bool {
         true
+    }
+}
+
+impl RemoteKeypairMedium for OpenpgpCard {
+    fn has_existing_keypair(&self) -> Result<bool, RemoteKeypairMediumError> {
+        let mut pgp_mut = self.pgp.borrow_mut();
+        let opt = &mut pgp_mut.transaction()?;
+        let ard = opt.application_related_data()?;
+        if let Some(key_info) = ard.key_information()? {
+            // Signing keypair exists on card if and only if signing key status
+            // is anything other than NotPresent.
+            Ok(key_info.sig_status() != KeyStatus::NotPresent)
+        } else {
+            Err(RemoteKeypairMediumError::Custom("could not get signing key status".to_string()))
+        }
+    }
+
+    fn generate_keypair(&self) -> Result<(), RemoteKeypairMediumError> {
+        let mut pgp_mut = self.pgp.borrow_mut();
+        let opt = &mut pgp_mut.transaction()?;
+        let card_info: OpenpgpCardInfo = opt.try_into()?;
+
+        // Prompt user for admin PIN verification
+        let mut pin = get_pin_from_user_as_bytes(&card_info, true, true).map_err(
+            |e| RemoteKeypairMediumError::Custom(e.to_string())
+        )?;
+        while opt.verify_pw3(pin.as_bytes()).is_err() {
+            pin = get_pin_from_user_as_bytes(&card_info, true, false).map_err(
+                |e| RemoteKeypairMediumError::Custom(e.to_string())
+            )?;
+        }
+
+        // Call keygen primitive on card
+        opt.generate_key(
+            get_pgp_key_fingerprint,
+            KeyType::Signing,
+            Some(&Algo::Ecc(EccAttrs::new(
+                EccType::EdDSA,
+                Curve::Ed25519,
+                None,
+            ))),
+        )?;
+        Ok(())
     }
 }
 
@@ -244,7 +296,11 @@ impl TryFrom<&mut OpenPgpTransaction<'_>> for OpenpgpCardInfo {
     }
 }
 
-fn get_pin_from_user_as_bytes(card_info: &OpenpgpCardInfo, first_attempt: bool) -> Result<String, SignerError> {
+fn get_pin_from_user_as_bytes(
+    card_info: &OpenpgpCardInfo,
+    admin: bool,
+    first_attempt: bool,
+) -> Result<String, Box<dyn error::Error>> {
     let description = format!(
         "\
             Please unlock the card%0A\
@@ -260,13 +316,21 @@ fn get_pin_from_user_as_bytes(card_info: &OpenpgpCardInfo, first_attempt: bool) 
         if first_attempt { "" } else { "%0A%0A##### INVALID PIN #####" },
     );
     let pin = if let Some(mut input) = PassphraseInput::with_default_binary() {
-        input.with_description(description.as_str()).with_prompt("PIN").interact().map_err(
-            |e| SignerError::InvalidInput(format!("cannot read PIN from user: {}", e))
-        )?
+        input.with_description(description.as_str()).with_prompt(
+            if admin { "Admin PIN" } else { "PIN" }
+        ).interact().map_err(|e| e.to_string())?
     } else {
-        return Err(SignerError::Custom("pinentry binary not found, please install".to_string()));
+        return Err("pinentry binary not found, please install".into());
     };
     Ok(pin.expose_secret().to_owned())
+}
+
+fn get_pgp_key_fingerprint(
+    pkm: &PublicKeyMaterial,
+    kgt: KeyGenerationTime,
+    key_type: KeyType,
+) -> Result<Fingerprint, openpgp_card::Error> {
+    Ok(Fingerprint::from([1; 20]))
 }
 
 #[cfg(test)]
