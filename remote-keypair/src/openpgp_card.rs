@@ -12,6 +12,7 @@ use {
     openpgp_card_pcsc::PcscBackend,
     pinentry::PassphraseInput,
     secrecy::ExposeSecret,
+    sha1::Sha1,
     solana_sdk::{
         pubkey::Pubkey,
         signature::{Signature, Signer, SignerError},
@@ -325,12 +326,32 @@ fn get_pin_from_user_as_bytes(
     Ok(pin.expose_secret().to_owned())
 }
 
+/// Derive a PGP fingerprint to associate with the generated PGP key, using the
+/// algorithm specified in [RFC 4880 Section 12.2][rfc4880]. The implementation
+/// below is specific to ed25519 signing keys.
+/// 
+/// [rfc4880]: https://www.rfc-editor.org/rfc/rfc4880#section-12.2
 fn get_pgp_key_fingerprint(
     pkm: &PublicKeyMaterial,
     kgt: KeyGenerationTime,
-    key_type: KeyType,
+    _key_type: KeyType,
 ) -> Result<Fingerprint, openpgp_card::Error> {
-    Ok(Fingerprint::from([1; 20]))
+    let mut hasher = Sha1::new();
+    hasher.update(&[0x99u8]);     // indicator byte (1 B)
+    hasher.update(&[0u8, 51u8]);  // length of data to follow, always 51 bytes for ed25519 keys (2 B)
+    hasher.update(&[4u8]);        // OpenPGP message version (1 B)
+    hasher.update(&kgt.get().to_be_bytes());  // key creation time (4 B)
+    hasher.update(&[              // ECC algorithm info, hardcoded for ed25519 (14 B)
+        0x16, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01,
+        0xda, 0x47, 0x0f, 0x01, 0x01, 0x07, 0x40,
+    ]);
+    match pkm {
+        PublicKeyMaterial::E(eccpub) => {
+            hasher.update(eccpub.data());  // ed25519 public key (32 B)
+        },
+        _ => return Err(openpgp_card::Error::UnsupportedAlgo("expected ECC key, got RSA".to_string())),
+    };
+    Ok(Fingerprint::from(hasher.digest().bytes()))
 }
 
 #[cfg(test)]
@@ -342,7 +363,7 @@ mod tests {
         // no identifier in URI => default locator
         let uri = URIReference::try_from("pgpcard://").unwrap();
         assert_eq!(
-            Locator::new_from_uri(&uri),
+            Locator::try_from(&uri),
             Ok(Locator { aid: None }),
         );
 
@@ -357,22 +378,51 @@ mod tests {
             0x00, 0x00                      // reserved
         ];
         assert_eq!(
-            Locator::new_from_uri(&uri),
+            Locator::try_from(&uri),
             Ok(Locator { aid: Some(ApplicationIdentifier::try_from(&expected_ident_bytes[..]).unwrap()) }),
         );
 
         // non-hex character in identifier
         let uri = URIReference::try_from("pgpcard://G2760001240103040006123456780000").unwrap();
         assert_eq!(
-            Locator::new_from_uri(&uri),
+            Locator::try_from(&uri),
             Err(LocatorError::IdentifierParseError("non-hex character found in identifier".to_string())),
         );
 
         // invalid identifier length
         let uri = URIReference::try_from("pgpcard://D27600012401030400061234567800").unwrap();
         assert_eq!(
-            Locator::new_from_uri(&uri),
+            Locator::try_from(&uri),
             Err(LocatorError::IdentifierParseError("invalid identifier format".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_get_fingerprint() {
+        use openpgp_card::crypto_data::EccPub;
+
+        let pkm = PublicKeyMaterial::E(EccPub::new(
+            vec![
+                0x5B, 0x92, 0xEF, 0x74, 0xA4, 0xF7, 0x9D, 0xAB,
+                0xF6, 0x8C, 0x15, 0x94, 0x3F, 0x9A, 0x01, 0x81,
+                0xF9, 0x39, 0xD0, 0xF3, 0xA0, 0x1E, 0x4F, 0x88,
+                0x0E, 0xEC, 0x7B, 0x51, 0x93, 0xC2, 0x24, 0x69
+            ],
+            Algo::Ecc(EccAttrs::new(
+                EccType::EdDSA,
+                Curve::Ed25519,
+                None,
+            ))
+        ));
+        let kgt: KeyGenerationTime = 1677533611.into();
+        let key_type = KeyType::Signing;
+        let fingerprint = get_pgp_key_fingerprint(&pkm, kgt, key_type).unwrap();
+        assert_eq!(
+            fingerprint.as_bytes(),
+            [
+                0xf2, 0xcf, 0x3e, 0x18, 0x39, 0xe3, 0x60, 0xbf, 0x51, 0x8b,
+                0x65, 0xba, 0x78, 0x05, 0x20, 0xe8, 0x80, 0xa9, 0x6c, 0xd3,
+            ],
         );
     }
 }
