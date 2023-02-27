@@ -12,6 +12,10 @@ use {
         ArgConstant, DisplayError,
     },
     solana_cli_config::{Config, CONFIG_FILE},
+    solana_remote_keypair::{
+        openpgp_card::{Locator as OpenpgpCardLocator, OpenpgpCard},
+        medium::{RemoteKeypairMedium, RemoteKeypairMediumError},
+    },
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_sdk::{
         derivation_path::DerivationPath,
@@ -130,6 +134,19 @@ fn check_for_overwrite(outfile: &str, matches: &ArgMatches) {
         eprintln!("Refusing to overwrite {outfile} without --force flag");
         exit(1);
     }
+}
+
+fn check_remote_medium_for_overwrite(
+    medium: &dyn RemoteKeypairMedium,
+    locator_uri: &uriparse::URIReference,
+    matches: &ArgMatches,
+) -> Result<(), RemoteKeypairMediumError> {
+    let force = matches.is_present("force");
+    if !force && medium.has_existing_keypair()? {
+        eprintln!("Refusing to overwrite {locator_uri} without --force flag");
+        exit(1);
+    }
+    Ok(())
 }
 
 fn get_keypair_from_matches(
@@ -357,6 +374,25 @@ fn acquire_derivation_path(
     }
 }
 
+fn parse_remote_keypair_medium(
+    locator_uri: &uriparse::URIReference,
+) -> Result<Box<dyn RemoteKeypairMedium>, RemoteKeypairMediumError> {
+    if let Some(scheme) = locator_uri.scheme() {
+        let scheme = scheme.as_str().to_ascii_lowercase();
+        match scheme.as_str() {
+            "pgpcard" => {
+                let locator = OpenpgpCardLocator::try_from(locator_uri).map_err(
+                    |e| RemoteKeypairMediumError::Custom(format!("could not get PGP card from locator: {}", e))
+                )?;
+                Ok(Box::new(OpenpgpCard::try_from(&locator)?))
+            },
+            _ => Err(RemoteKeypairMediumError::UnrecognizedType(scheme.to_string()))
+        }
+    } else {
+        return Err(RemoteKeypairMediumError::UnrecognizedType("no scheme found".to_string()));
+    }
+}
+
 fn main() -> Result<(), Box<dyn error::Error>> {
     let default_num_threads = num_cpus::get().to_string();
     let matches = Command::new(crate_name!())
@@ -427,6 +463,26 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .key_generation_common_args()
                 .arg(no_outfile_arg()
                     .conflicts_with_all(&["outfile", "silent"])
+                )
+        )
+        .subcommand(
+            Command::new("new-remote")
+                .about("Generate new keypair directly on hardware token")
+                .disable_version_flag(true)
+                .arg(
+                    Arg::new("locator")
+                        .short('l')
+                        .long("locator")
+                        .value_name("LOCATOR_URI")
+                        .takes_value(true)
+                        .required(true)
+                        .help("URI identifying hardware token to generate keypair on")
+                )
+                .arg(
+                    Arg::new("force")
+                        .short('f')
+                        .long("force")
+                        .help("Overwrite keypair on token if it exists")
                 )
         )
         .subcommand(
@@ -640,6 +696,13 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                     &divider, keypair.pubkey(), &divider, passphrase_message, phrase, &divider
                 );
             }
+        }
+        ("new-remote", matches) => {
+            let locator_uri = uriparse::URIReference::try_from(matches.value_of("locator").unwrap())?;
+            let kp_medium = parse_remote_keypair_medium(&locator_uri)?;
+            check_remote_medium_for_overwrite(kp_medium.as_ref(), &locator_uri, matches)?;
+            kp_medium.generate_keypair()?;
+            println!("New keypair generated on {}", locator_uri);
         }
         ("recover", matches) => {
             let mut path = dirs_next::home_dir().expect("home directory");
