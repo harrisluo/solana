@@ -14,7 +14,6 @@ openpgp-card = { workspace = true }
 openpgp-card-pcsc = { workspace = true }
 pinentry = { workspace = true }
 secrecy = { workspace = true }
-sha1 = "0.6.1"
 solana-sdk = { workspace = true }
 thiserror = { workspace = true }
 uriparse = { workspace = true }
