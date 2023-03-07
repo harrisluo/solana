@@ -1,4 +1,7 @@
-use thiserror::Error;
+use {
+    solana_sdk::pubkey::Pubkey,
+    thiserror::Error,
+};
 
 /// The `RemoteKeypairMedium` trait declares operations that all remote keypair
 /// storage media must support. These operations allow keygen tools to safely
@@ -8,7 +11,7 @@ pub trait RemoteKeypairMedium {
     fn has_existing_keypair(&self) -> Result<bool, RemoteKeypairMediumError>;
 
     // Fallibly generates an ed25519 signing keypair directly on the medium
-    fn generate_keypair(&self) -> Result<(), RemoteKeypairMediumError>;
+    fn generate_keypair(&self) -> Result<Pubkey, RemoteKeypairMediumError>;
 }
 
 #[derive(Debug, Error)]

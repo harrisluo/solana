@@ -159,24 +159,10 @@ impl Signer for OpenpgpCard {
         let pk_material = opt.public_key(openpgp_card::KeyType::Signing).map_err(
             |e| SignerError::Connection(format!("could not find signing keypair on card: {}", e))
         )?;
-        let pk_bytes: [u8; 32] = match pk_material {
-            PublicKeyMaterial::E(pk) => match pk.algo() {
-                Algo::Ecc(ecc_attrs) => {
-                    if ecc_attrs.ecc_type() != EccType::EdDSA || ecc_attrs.curve() != Curve::Ed25519 {
-                        return Err(SignerError::Connection(
-                            format!("expected Ed25519 key, got {:?}", ecc_attrs.curve())
-                        ));
-                    }
-                    pk.data().try_into().map_err(
-                        |e| SignerError::Connection(format!("key on card is malformed: {}", e))
-                    )?
-                },
-                _ => return Err(SignerError::Connection("expected ECC key, got RSA".to_string())),
-            }
-            _ => return Err(SignerError::Connection("expected ECC key, got RSA".to_string())),
-        };
-
-        Ok(Pubkey::from(pk_bytes))
+        let pubkey = get_pubkey_from_pk_material(pk_material).map_err(
+            |e| SignerError::Connection(format!("public key on card is invalid: {}", e))
+        )?;
+        Ok(pubkey)
     }
 
     fn try_sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
@@ -243,7 +229,7 @@ impl RemoteKeypairMedium for OpenpgpCard {
         }
     }
 
-    fn generate_keypair(&self) -> Result<(), RemoteKeypairMediumError> {
+    fn generate_keypair(&self) -> Result<Pubkey, RemoteKeypairMediumError> {
         let mut pgp_mut = self.pgp.borrow_mut();
         let opt = &mut pgp_mut.transaction()?;
         let card_info: OpenpgpCardInfo = opt.try_into()?;
@@ -259,7 +245,7 @@ impl RemoteKeypairMedium for OpenpgpCard {
         }
 
         // Call keygen primitive on card
-        opt.generate_key(
+        let (pk_material, _) = opt.generate_key(
             get_pgp_key_fingerprint,
             KeyType::Signing,
             Some(&Algo::Ecc(EccAttrs::new(
@@ -268,7 +254,7 @@ impl RemoteKeypairMedium for OpenpgpCard {
                 None,
             ))),
         )?;
-        Ok(())
+        Ok(get_pubkey_from_pk_material(pk_material)?)
     }
 }
 
@@ -295,6 +281,26 @@ impl TryFrom<&mut OpenPgpTransaction<'_>> for OpenpgpCardInfo {
             pin_cds_valid_once: ard.pw_status_bytes()?.pw1_cds_valid_once(),
         })
     }
+}
+
+fn get_pubkey_from_pk_material(pk_material: PublicKeyMaterial) -> Result<Pubkey, openpgp_card::Error> {
+    let pk_bytes: [u8; 32] = match pk_material {
+        PublicKeyMaterial::E(pk) => match pk.algo() {
+            Algo::Ecc(ecc_attrs) => {
+                if ecc_attrs.ecc_type() != EccType::EdDSA || ecc_attrs.curve() != Curve::Ed25519 {
+                    return Err(openpgp_card::Error::UnsupportedAlgo(
+                        format!("expected Ed25519 key, got {:?}", ecc_attrs.curve())
+                    ));
+                }
+                pk.data().try_into().map_err(
+                    |e| openpgp_card::Error::ParseError(format!("key on card is malformed: {}", e))
+                )?
+            },
+            _ => return Err(openpgp_card::Error::UnsupportedAlgo("expected ECC key, got RSA".to_string())),
+        }
+        _ => return Err(openpgp_card::Error::UnsupportedAlgo("expected ECC key, got RSA".to_string())),
+    };
+    Ok(Pubkey::from(pk_bytes))
 }
 
 fn get_pin_from_user_as_bytes(

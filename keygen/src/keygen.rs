@@ -701,8 +701,9 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             let locator_uri = uriparse::URIReference::try_from(matches.value_of("locator").unwrap())?;
             let kp_medium = parse_remote_keypair_medium(&locator_uri)?;
             check_remote_medium_for_overwrite(kp_medium.as_ref(), &locator_uri, matches)?;
-            kp_medium.generate_keypair()?;
+            let pubkey = kp_medium.generate_keypair()?;
             println!("New keypair generated on {}", locator_uri);
+            println!("Public key: {pubkey}");
         }
         ("recover", matches) => {
             let mut path = dirs_next::home_dir().expect("home directory");
