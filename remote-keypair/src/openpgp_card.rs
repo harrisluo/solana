@@ -362,7 +362,10 @@ fn get_pgp_key_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        openpgp_card::crypto_data::{EccPub, RSAPub},
+    };
 
     #[test]
     fn test_parse_locator() {
@@ -404,15 +407,64 @@ mod tests {
     }
 
     #[test]
-    fn test_get_fingerprint() {
-        use openpgp_card::crypto_data::EccPub;
+    fn test_get_pubkey_from_pk_material() {
+        // Test valid ed25519 pubkey
+        let pk_bytes: [u8; 32] = [
+            0x5B, 0x92, 0xEF, 0x74, 0xA4, 0xF7, 0x9D, 0xAB,
+            0xF6, 0x8C, 0x15, 0x94, 0x3F, 0x9A, 0x01, 0x81,
+            0xF9, 0x39, 0xD0, 0xF3, 0xA0, 0x1E, 0x4F, 0x88,
+            0x0E, 0xEC, 0x7B, 0x51, 0x93, 0xC2, 0x24, 0x69,
+        ];
+        let pk_material = PublicKeyMaterial::E(EccPub::new(
+            pk_bytes.to_vec(),
+            Algo::Ecc(EccAttrs::new(EccType::EdDSA, Curve::Ed25519, None)),
+        ));
+        assert_eq!(
+            get_pubkey_from_pk_material(pk_material).unwrap(),
+            Pubkey::from(pk_bytes),
+        );
 
+        // Test malformed ed25519 pubkey
+        let pk_material = PublicKeyMaterial::E(EccPub::new(
+            vec![
+                0x5B, 0x92, 0xEF, 0x74, 0xA4, 0xF7, 0x9D, 0xAB,
+                0xF6, 0x8C, 0x15, 0x94, 0x3F, 0x9A, 0x01, 0x81,
+                0xF9, 0x39, 0xD0, 0xF3, 0xA0, 0x1E, 0x4F, 0x88,
+                0x0E, 0xEC, 0x7B, 0x51, 0x93, 0xC2, 0x24, 0x69, 0x00,
+            ],
+            Algo::Ecc(EccAttrs::new(EccType::EdDSA, Curve::Ed25519, None)),
+        ));
+        assert!(matches!(
+            get_pubkey_from_pk_material(pk_material),
+            Err(openpgp_card::Error::ParseError(_)),
+        ));
+
+        // Test unsupported algorithms
+        let pk_material = PublicKeyMaterial::E(EccPub::new(
+            pk_bytes.to_vec(),
+            Algo::Ecc(EccAttrs::new(EccType::EdDSA, Curve::Ed448, None)),
+        ));
+        assert!(matches!(
+            get_pubkey_from_pk_material(pk_material),
+            Err(openpgp_card::Error::UnsupportedAlgo(_)),
+        ));
+        let pk_material = PublicKeyMaterial::R(RSAPub::new(
+            vec![0u8; 0], vec![0u8; 0]
+        ));
+        assert!(matches!(
+            get_pubkey_from_pk_material(pk_material),
+            Err(openpgp_card::Error::UnsupportedAlgo(_)),
+        ));
+    }
+
+    #[test]
+    fn test_get_fingerprint() {
         let pkm = PublicKeyMaterial::E(EccPub::new(
             vec![
                 0x5B, 0x92, 0xEF, 0x74, 0xA4, 0xF7, 0x9D, 0xAB,
                 0xF6, 0x8C, 0x15, 0x94, 0x3F, 0x9A, 0x01, 0x81,
                 0xF9, 0x39, 0xD0, 0xF3, 0xA0, 0x1E, 0x4F, 0x88,
-                0x0E, 0xEC, 0x7B, 0x51, 0x93, 0xC2, 0x24, 0x69
+                0x0E, 0xEC, 0x7B, 0x51, 0x93, 0xC2, 0x24, 0x69,
             ],
             Algo::Ecc(EccAttrs::new(
                 EccType::EdDSA,
