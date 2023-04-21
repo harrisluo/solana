@@ -1,19 +1,17 @@
+mod snapshot_gossip_manager;
 use {
-    solana_gossip::cluster_info::{
-        ClusterInfo, MAX_INCREMENTAL_SNAPSHOT_HASHES, MAX_SNAPSHOT_HASHES,
-    },
+    crossbeam_channel::{Receiver, Sender},
+    snapshot_gossip_manager::SnapshotGossipManager,
+    solana_gossip::cluster_info::{ClusterInfo, MAX_LEGACY_SNAPSHOT_HASHES},
+    solana_measure::measure_us,
     solana_perf::thread::renice_this_thread,
     solana_runtime::{
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
-        snapshot_hash::{
-            FullSnapshotHash, FullSnapshotHashes, IncrementalSnapshotHash,
-            IncrementalSnapshotHashes, StartingSnapshotHashes,
-        },
-        snapshot_package::{retain_max_n_elements, PendingSnapshotPackage, SnapshotType},
+        snapshot_hash::StartingSnapshotHashes,
+        snapshot_package::{self, SnapshotPackage},
         snapshot_utils,
     },
-    solana_sdk::{clock::Slot, hash::Hash},
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -29,8 +27,12 @@ pub struct SnapshotPackagerService {
 }
 
 impl SnapshotPackagerService {
+    /// If there are no snapshot packages to handle, limit how often we re-check
+    const LOOP_LIMITER: Duration = Duration::from_millis(100);
+
     pub fn new(
-        pending_snapshot_package: PendingSnapshotPackage,
+        snapshot_package_sender: Sender<SnapshotPackage>,
+        snapshot_package_receiver: Receiver<SnapshotPackage>,
         starting_snapshot_hashes: Option<StartingSnapshotHashes>,
         exit: &Arc<AtomicBool>,
         cluster_info: &Arc<ClusterInfo>,
@@ -40,29 +42,23 @@ impl SnapshotPackagerService {
         let exit = exit.clone();
         let cluster_info = cluster_info.clone();
         let max_full_snapshot_hashes = std::cmp::min(
-            MAX_SNAPSHOT_HASHES,
-            snapshot_config.maximum_full_snapshot_archives_to_retain,
-        );
-        let max_incremental_snapshot_hashes = std::cmp::min(
-            MAX_INCREMENTAL_SNAPSHOT_HASHES,
-            snapshot_config.maximum_incremental_snapshot_archives_to_retain,
+            MAX_LEGACY_SNAPSHOT_HASHES,
+            snapshot_config
+                .maximum_full_snapshot_archives_to_retain
+                .get(),
         );
 
         let t_snapshot_packager = Builder::new()
             .name("solSnapshotPkgr".to_string())
             .spawn(move || {
+                info!("SnapshotPackagerService has started");
                 renice_this_thread(snapshot_config.packager_thread_niceness_adj).unwrap();
-                let mut snapshot_gossip_manager = if enable_gossip_push {
-                    Some(SnapshotGossipManager {
+                let mut snapshot_gossip_manager = enable_gossip_push.then(||
+                    SnapshotGossipManager::new(
                         cluster_info,
                         max_full_snapshot_hashes,
-                        max_incremental_snapshot_hashes,
-                        full_snapshot_hashes: FullSnapshotHashes::default(),
-                        incremental_snapshot_hashes: IncrementalSnapshotHashes::default(),
-                    })
-                } else {
-                    None
-                };
+                    )
+                );
                 if let Some(snapshot_gossip_manager) = snapshot_gossip_manager.as_mut() {
                     snapshot_gossip_manager.push_starting_snapshot_hashes(starting_snapshot_hashes);
                 }
@@ -72,32 +68,55 @@ impl SnapshotPackagerService {
                         break;
                     }
 
-                    let snapshot_package = pending_snapshot_package.lock().unwrap().take();
-                    if snapshot_package.is_none() {
-                        std::thread::sleep(Duration::from_millis(100));
+                    let Some((
+                        snapshot_package,
+                        num_outstanding_snapshot_packages,
+                        num_re_enqueued_snapshot_packages,
+                    )) = Self::get_next_snapshot_package(&snapshot_package_sender, &snapshot_package_receiver) else {
+                        std::thread::sleep(Self::LOOP_LIMITER);
                         continue;
-                    }
-                    let snapshot_package = snapshot_package.unwrap();
+                    };
+                    info!("handling snapshot package: {snapshot_package:?}");
+                    let enqueued_time = snapshot_package.enqueued.elapsed();
 
-                    // Archiving the snapshot package is not allowed to fail.
-                    // AccountsBackgroundService calls `clean_accounts()` with a value for
-                    // last_full_snapshot_slot that requires this archive call to succeed.
-                    snapshot_utils::archive_snapshot_package(
-                        &snapshot_package,
-                        &snapshot_config.full_snapshot_archives_dir,
-                        &snapshot_config.incremental_snapshot_archives_dir,
-                        snapshot_config.maximum_full_snapshot_archives_to_retain,
-                        snapshot_config.maximum_incremental_snapshot_archives_to_retain,
-                    )
-                    .expect("failed to archive snapshot package");
+                    let (_, handling_time_us) = measure_us!({
+                        // Archiving the snapshot package is not allowed to fail.
+                        // AccountsBackgroundService calls `clean_accounts()` with a value for
+                        // last_full_snapshot_slot that requires this archive call to succeed.
+                        snapshot_utils::archive_snapshot_package(
+                            &snapshot_package,
+                            &snapshot_config.full_snapshot_archives_dir,
+                            &snapshot_config.incremental_snapshot_archives_dir,
+                            snapshot_config.maximum_full_snapshot_archives_to_retain,
+                            snapshot_config.maximum_incremental_snapshot_archives_to_retain,
+                        )
+                        .expect("failed to archive snapshot package");
 
-                    if let Some(snapshot_gossip_manager) = snapshot_gossip_manager.as_mut() {
-                        snapshot_gossip_manager.push_snapshot_hash(
-                            snapshot_package.snapshot_type,
-                            (snapshot_package.slot(), snapshot_package.hash().0),
-                        );
-                    }
+                        if let Some(snapshot_gossip_manager) = snapshot_gossip_manager.as_mut() {
+                            snapshot_gossip_manager.push_snapshot_hash(
+                                snapshot_package.snapshot_type,
+                                (snapshot_package.slot(), *snapshot_package.hash()),
+                            );
+                        }
+                    });
+
+                    datapoint_info!(
+                        "snapshot_packager_service",
+                        (
+                            "num-outstanding-snapshot-packages",
+                            num_outstanding_snapshot_packages,
+                            i64
+                        ),
+                        (
+                            "num-re-enqueued-snapshot-packages",
+                            num_re_enqueued_snapshot_packages,
+                            i64
+                        ),
+                        ("enqueued-time-us", enqueued_time.as_micros(), i64),
+                        ("handling-time-us", handling_time_us, i64),
+                    );
                 }
+                info!("SnapshotPackagerService has stopped");
             })
             .unwrap();
 
@@ -109,110 +128,57 @@ impl SnapshotPackagerService {
     pub fn join(self) -> thread::Result<()> {
         self.t_snapshot_packager.join()
     }
-}
 
-struct SnapshotGossipManager {
-    cluster_info: Arc<ClusterInfo>,
-    max_full_snapshot_hashes: usize,
-    max_incremental_snapshot_hashes: usize,
-    full_snapshot_hashes: FullSnapshotHashes,
-    incremental_snapshot_hashes: IncrementalSnapshotHashes,
-}
-
-impl SnapshotGossipManager {
-    /// If there were starting snapshot hashes, add those to their respective vectors, then push
-    /// those vectors to the cluster via CRDS.
-    fn push_starting_snapshot_hashes(
-        &mut self,
-        starting_snapshot_hashes: Option<StartingSnapshotHashes>,
-    ) {
-        if let Some(starting_snapshot_hashes) = starting_snapshot_hashes {
-            let starting_full_snapshot_hash = starting_snapshot_hashes.full;
-            self.push_full_snapshot_hash(starting_full_snapshot_hash);
-
-            if let Some(starting_incremental_snapshot_hash) = starting_snapshot_hashes.incremental {
-                self.push_incremental_snapshot_hash(starting_incremental_snapshot_hash);
-            };
+    /// Get the next snapshot package to handle
+    ///
+    /// Look through the snapshot package channel to find the highest priority one to handle next.
+    /// If there are no snapshot packages in the channel, return None.  Otherwise return the
+    /// highest priority one.  Unhandled snapshot packages with slots GREATER-THAN the handled one
+    /// will be re-enqueued.  The remaining will be dropped.
+    ///
+    /// Also return the number of snapshot packages initially in the channel, and the number of
+    /// ones re-enqueued.
+    fn get_next_snapshot_package(
+        snapshot_package_sender: &Sender<SnapshotPackage>,
+        snapshot_package_receiver: &Receiver<SnapshotPackage>,
+    ) -> Option<(
+        SnapshotPackage,
+        /*num outstanding snapshot packages*/ usize,
+        /*num re-enqueued snapshot packages*/ usize,
+    )> {
+        let mut snapshot_packages: Vec<_> = snapshot_package_receiver.try_iter().collect();
+        // `select_nth()` panics if the slice is empty, so return if that's the case
+        if snapshot_packages.is_empty() {
+            return None;
         }
-    }
+        let snapshot_packages_len = snapshot_packages.len();
+        debug!("outstanding snapshot packages ({snapshot_packages_len}): {snapshot_packages:?}");
 
-    /// Add `snapshot_hash` to its respective vector of hashes, then push that vector to the
-    /// cluster via CRDS.
-    fn push_snapshot_hash(&mut self, snapshot_type: SnapshotType, snapshot_hash: (Slot, Hash)) {
-        match snapshot_type {
-            SnapshotType::FullSnapshot => {
-                self.push_full_snapshot_hash(FullSnapshotHash {
-                    hash: snapshot_hash,
-                });
-            }
-            SnapshotType::IncrementalSnapshot(base_slot) => {
-                let latest_full_snapshot_hash = *self.full_snapshot_hashes.hashes.last().unwrap();
-                assert_eq!(
-                    base_slot, latest_full_snapshot_hash.0,
-                    "the incremental snapshot's base slot ({}) must match the latest full snapshot hash's slot ({})",
-                    base_slot, latest_full_snapshot_hash.0,
-                );
-                self.push_incremental_snapshot_hash(IncrementalSnapshotHash {
-                    base: latest_full_snapshot_hash,
-                    hash: snapshot_hash,
-                });
-            }
-        }
-    }
-
-    /// Add `full_snapshot_hash` to the vector of full snapshot hashes, then push that vector to
-    /// the cluster via CRDS.
-    fn push_full_snapshot_hash(&mut self, full_snapshot_hash: FullSnapshotHash) {
-        self.full_snapshot_hashes
-            .hashes
-            .push(full_snapshot_hash.hash);
-
-        retain_max_n_elements(
-            &mut self.full_snapshot_hashes.hashes,
-            self.max_full_snapshot_hashes,
+        snapshot_packages.select_nth_unstable_by(
+            snapshot_packages_len - 1,
+            snapshot_package::cmp_snapshot_packages_by_priority,
         );
+        // SAFETY: We know `snapshot_packages` is not empty, so its len is >= 1,
+        // therefore there is always an element to pop.
+        let snapshot_package = snapshot_packages.pop().unwrap();
+        let handled_snapshot_package_slot = snapshot_package.slot();
+        // re-enqueue any remaining snapshot packages for slots GREATER-THAN the snapshot package
+        // that will be handled
+        let num_re_enqueued_snapshot_packages = snapshot_packages
+            .into_iter()
+            .filter(|snapshot_package| snapshot_package.slot() > handled_snapshot_package_slot)
+            .map(|snapshot_package| {
+                snapshot_package_sender
+                    .try_send(snapshot_package)
+                    .expect("re-enqueue snapshot package")
+            })
+            .count();
 
-        self.cluster_info
-            .push_snapshot_hashes(self.full_snapshot_hashes.hashes.clone());
-    }
-
-    /// Add `incremental_snapshot_hash` to the vector of incremental snapshot hashes, then push
-    /// that vector to the cluster via CRDS.
-    fn push_incremental_snapshot_hash(
-        &mut self,
-        incremental_snapshot_hash: IncrementalSnapshotHash,
-    ) {
-        // If the base snapshot hash is different from the one in IncrementalSnapshotHashes, then
-        // that means the old incremental snapshot hashes are no longer valid, so clear them all
-        // out.
-        if incremental_snapshot_hash.base != self.incremental_snapshot_hashes.base {
-            self.incremental_snapshot_hashes.hashes.clear();
-            self.incremental_snapshot_hashes.base = incremental_snapshot_hash.base;
-        }
-
-        self.incremental_snapshot_hashes
-            .hashes
-            .push(incremental_snapshot_hash.hash);
-
-        retain_max_n_elements(
-            &mut self.incremental_snapshot_hashes.hashes,
-            self.max_incremental_snapshot_hashes,
-        );
-
-        // Pushing incremental snapshot hashes to the cluster should never fail.  The only error
-        // case is when the length of the hashes is too big, but we account for that with
-        // `max_incremental_snapshot_hashes`.  If this call ever does error, it's a programmer bug!
-        // Check to see what changed in `push_incremental_snapshot_hashes()` and handle the new
-        // error condition here.
-        self.cluster_info
-            .push_incremental_snapshot_hashes(
-                self.incremental_snapshot_hashes.base,
-                self.incremental_snapshot_hashes.hashes.clone(),
-            )
-            .expect(
-                "Bug! The programmer contract has changed for push_incremental_snapshot_hashes() \
-                 and a new error case has been added, which has not been handled here.",
-            );
+        Some((
+            snapshot_package,
+            snapshot_packages_len,
+            num_re_enqueued_snapshot_packages,
+        ))
     }
 }
 
@@ -221,6 +187,7 @@ mod tests {
     use {
         super::*,
         bincode::serialize_into,
+        rand::seq::SliceRandom,
         solana_runtime::{
             accounts_db::AccountStorageEntry,
             bank::BankSlotDelta,
@@ -232,11 +199,12 @@ mod tests {
                 SNAPSHOT_STATUS_CACHE_FILENAME,
             },
         },
-        solana_sdk::hash::Hash,
+        solana_sdk::{clock::Slot, hash::Hash},
         std::{
             fs::{self, remove_dir_all, OpenOptions},
             io::Write,
             path::{Path, PathBuf},
+            time::Instant,
         },
         tempfile::TempDir,
     };
@@ -335,6 +303,7 @@ mod tests {
             snapshot_storages: storage_entries,
             snapshot_version: SnapshotVersion::default(),
             snapshot_type: SnapshotType::FullSnapshot,
+            enqueued: Instant::now(),
         };
 
         // Make tarball from packageable snapshot
@@ -368,5 +337,96 @@ mod tests {
             archive_format,
             snapshot_utils::VerifyBank::Deterministic,
         );
+    }
+
+    /// Ensure that unhandled snapshot packages are properly re-enqueued or dropped
+    ///
+    /// The snapshot package handler should re-enqueue unhandled snapshot packages, if those
+    /// unhandled snapshot packages are for slots GREATER-THAN the last handled snapshot package.
+    /// Otherwise, they should be dropped.
+    #[test]
+    fn test_get_next_snapshot_package() {
+        fn new(snapshot_type: SnapshotType, slot: Slot) -> SnapshotPackage {
+            SnapshotPackage {
+                snapshot_archive_info: SnapshotArchiveInfo {
+                    path: PathBuf::default(),
+                    slot,
+                    hash: SnapshotHash(Hash::default()),
+                    archive_format: ArchiveFormat::Tar,
+                },
+                block_height: slot,
+                snapshot_links: TempDir::new().unwrap(),
+                snapshot_storages: Vec::default(),
+                snapshot_version: SnapshotVersion::default(),
+                snapshot_type,
+                enqueued: Instant::now(),
+            }
+        }
+        fn new_full(slot: Slot) -> SnapshotPackage {
+            new(SnapshotType::FullSnapshot, slot)
+        }
+        fn new_incr(slot: Slot, base: Slot) -> SnapshotPackage {
+            new(SnapshotType::IncrementalSnapshot(base), slot)
+        }
+
+        let (snapshot_package_sender, snapshot_package_receiver) = crossbeam_channel::unbounded();
+
+        // Populate the channel so that re-enqueueing and dropping will be tested
+        let mut snapshot_packages = [
+            new_full(100),
+            new_incr(110, 100),
+            new_incr(210, 100),
+            new_full(300),
+            new_incr(310, 300),
+            new_full(400), // <-- handle 1st
+            new_incr(410, 400),
+            new_incr(420, 400), // <-- handle 2nd
+        ];
+        // Shuffle the snapshot packages to simulate receiving new snapshot packages from AHV
+        // simultaneously as SPS is handling them.
+        snapshot_packages.shuffle(&mut rand::thread_rng());
+        snapshot_packages
+            .into_iter()
+            .for_each(|snapshot_package| snapshot_package_sender.send(snapshot_package).unwrap());
+
+        // The Full Snapshot from slot 400 is handled 1st
+        // (the older full snapshots are skipped and dropped)
+        let (
+            snapshot_package,
+            _num_outstanding_snapshot_packages,
+            num_re_enqueued_snapshot_packages,
+        ) = SnapshotPackagerService::get_next_snapshot_package(
+            &snapshot_package_sender,
+            &snapshot_package_receiver,
+        )
+        .unwrap();
+        assert_eq!(snapshot_package.snapshot_type, SnapshotType::FullSnapshot,);
+        assert_eq!(snapshot_package.slot(), 400);
+        assert_eq!(num_re_enqueued_snapshot_packages, 2);
+
+        // The Incremental Snapshot from slot 420 is handled 2nd
+        // (the older incremental snapshot from slot 410 is skipped and dropped)
+        let (
+            snapshot_package,
+            _num_outstanding_snapshot_packages,
+            num_re_enqueued_snapshot_packages,
+        ) = SnapshotPackagerService::get_next_snapshot_package(
+            &snapshot_package_sender,
+            &snapshot_package_receiver,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_package.snapshot_type,
+            SnapshotType::IncrementalSnapshot(400),
+        );
+        assert_eq!(snapshot_package.slot(), 420);
+        assert_eq!(num_re_enqueued_snapshot_packages, 0);
+
+        // And now the snapshot package channel is empty!
+        assert!(SnapshotPackagerService::get_next_snapshot_package(
+            &snapshot_package_sender,
+            &snapshot_package_receiver
+        )
+        .is_none());
     }
 }

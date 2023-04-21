@@ -18,6 +18,9 @@ use {
     bip39::{Language, Mnemonic, Seed},
     clap::ArgMatches,
     rpassword::prompt_password,
+    solana_remote_keypair::openpgp_card::{
+        Locator as OpenpgpCardLocator, LocatorError as OpenpgpCardLocatorError, OpenpgpCard,
+    },
     solana_remote_wallet::{
         locator::{Locator as RemoteWalletLocator, LocatorError as RemoteWalletLocatorError},
         remote_keypair::generate_remote_keypair,
@@ -173,13 +176,13 @@ impl DefaultSigner {
                         Ok(())
                     }
                 })
-                .map_err(|_| {
+                .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!(
-                        "No default signer found, run \"solana-keygen new -o {}\" to create a new one",
-                        self.path
-                    ),
+                            "Could not find default signer: {}. Run \"solana-keygen new -o {}\" to create a new one.",
+                            e, self.path
+                        ),
                     )
                 })?;
             *self.is_path_checked.borrow_mut() = true;
@@ -399,6 +402,7 @@ const SIGNER_SOURCE_FILEPATH: &str = "file";
 const SIGNER_SOURCE_USB: &str = "usb";
 const SIGNER_SOURCE_STDIN: &str = "stdin";
 const SIGNER_SOURCE_PUBKEY: &str = "pubkey";
+const SIGNER_SOURCE_PGPCARD: &str = "pgpcard";
 
 pub(crate) enum SignerSourceKind {
     Prompt,
@@ -406,6 +410,7 @@ pub(crate) enum SignerSourceKind {
     Usb(RemoteWalletLocator),
     Stdin,
     Pubkey(Pubkey),
+    Pgpcard(OpenpgpCardLocator),
 }
 
 impl AsRef<str> for SignerSourceKind {
@@ -416,6 +421,7 @@ impl AsRef<str> for SignerSourceKind {
             Self::Usb(_) => SIGNER_SOURCE_USB,
             Self::Stdin => SIGNER_SOURCE_STDIN,
             Self::Pubkey(_) => SIGNER_SOURCE_PUBKEY,
+            Self::Pgpcard(_) => SIGNER_SOURCE_PGPCARD,
         }
     }
 }
@@ -437,6 +443,8 @@ pub(crate) enum SignerSourceError {
     DerivationPathError(#[from] DerivationPathError),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    OpenpgpCardLocatorError(#[from] OpenpgpCardLocatorError),
 }
 
 pub(crate) fn parse_signer_source<S: AsRef<str>>(
@@ -482,6 +490,9 @@ pub(crate) fn parse_signer_source<S: AsRef<str>>(
                         legacy: false,
                     }),
                     SIGNER_SOURCE_STDIN => Ok(SignerSource::new(SignerSourceKind::Stdin)),
+                    SIGNER_SOURCE_PGPCARD => Ok(SignerSource::new(SignerSourceKind::Pgpcard(
+                        OpenpgpCardLocator::try_from(&uri)?,
+                    ))),
                     _ => {
                         #[cfg(target_family = "windows")]
                         // On Windows, an absolute path's drive letter will be parsed as the URI
@@ -617,6 +628,20 @@ pub struct SignerFromPathConfig {
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd`
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd?key=0/0`
 ///
+/// - `pgpcard:` &mdash; Use a connected OpenPGP smart card as the signer.
+///   In particular, use the key in the signing slot of the OpenPGP application
+///   on the card.
+///
+///   The URI host is the 16-byte OpenPGP AID in its standard hexadecimal form
+///   (32 digits). (For details, see section 4.2.1 of the
+///   [OpenPGP specification][pgpspec].) The URI host may also be omitted, in
+///   which case the first connected smart card that is found is used.
+///
+///   Examples:
+///
+///   - `pgpcard://`
+///   - `pgpcard://D2760001240103040006123456780000`
+///
 /// Next the `path` argument may be one of the following strings:
 ///
 /// - `-` &mdash; Read the keypair from stdin. This is the same as the `stdin:`
@@ -649,6 +674,7 @@ pub struct SignerFromPathConfig {
 /// [dp]: https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki
 /// [URI]: https://en.wikipedia.org/wiki/Uniform_Resource_Identifier
 /// ["hardened"]: https://wiki.trezor.io/Hardened_and_non-hardened_derivation
+/// [pgpspec]: https://gnupg.org/ftp/specs/OpenPGP-smart-card-application-3.4.pdf
 ///
 /// # Examples
 ///
@@ -815,6 +841,9 @@ pub fn signer_from_path_with_config(
                 )
                 .into())
             }
+        }
+        SignerSourceKind::Pgpcard(locator) => {
+            Ok(Box::new(OpenpgpCard::try_from(&locator)?))
         }
     }
 }
@@ -1121,6 +1150,7 @@ mod tests {
         super::*,
         crate::offline::OfflineArgs,
         clap::{value_t_or_exit, App, Arg},
+        openpgp_card::card_do::ApplicationIdentifier,
         solana_remote_wallet::{locator::Manufacturer, remote_wallet::initialize_wallet_manager},
         solana_sdk::{signer::keypair::write_keypair_file, system_instruction},
         tempfile::{NamedTempFile, TempDir},
@@ -1230,6 +1260,7 @@ mod tests {
             } if p == relative_path_str)
         );
 
+        // ledger signer source tests
         let usb = "usb://ledger".to_string();
         let expected_locator = RemoteWalletLocator {
             manufacturer: Manufacturer::Ledger,
@@ -1251,6 +1282,37 @@ mod tests {
                 derivation_path: d,
                 legacy: false,
             } if u == expected_locator && d == expected_derivation_path));
+
+        // pgpcard signer source tests
+        let pgpcard = "pgpcard://".to_string();
+        let expected_locator = OpenpgpCardLocator { aid: None };
+        assert!(
+            matches!(parse_signer_source(pgpcard).unwrap(), SignerSource {
+                kind: SignerSourceKind::Pgpcard(p),
+                derivation_path: None,
+                legacy: false,
+            } if p == expected_locator)
+        );
+        let pgpcard = "pgpcard://D2760001240103040006123456780000".to_string();
+        let expected_ident_bytes: [u8; 16] = [
+            0xD2, 0x76, 0x00, 0x01, 0x24, // preamble
+            0x01, // application id (OpenPGP)
+            0x03, 0x04, // version
+            0x00, 0x06, // manufacturer id
+            0x12, 0x34, 0x56, 0x78, // serial number
+            0x00, 0x00, // reserved
+        ];
+        let expected_locator = OpenpgpCardLocator {
+            aid: Some(ApplicationIdentifier::try_from(&expected_ident_bytes[..]).unwrap()),
+        };
+        assert!(
+            matches!(parse_signer_source(pgpcard).unwrap(), SignerSource {
+                kind: SignerSourceKind::Pgpcard(p),
+                derivation_path: None,
+                legacy: false,
+            } if p == expected_locator)
+        );
+
         // Catchall into SignerSource::Filepath fails
         let junk = "sometextthatisnotapubkeyorfile".to_string();
         assert!(Pubkey::from_str(&junk).is_err());

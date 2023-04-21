@@ -39,7 +39,6 @@ pub struct Meta {
     pub addr: IpAddr,
     pub port: u16,
     pub flags: PacketFlags,
-    pub sender_stake: u64,
 }
 
 // serde_as is used as a work around because array isn't supported by serde
@@ -123,7 +122,7 @@ impl Packet {
     }
 
     pub fn from_data<T: Serialize>(dest: Option<&SocketAddr>, data: T) -> Result<Self> {
-        let mut packet = Packet::default();
+        let mut packet = Self::default();
         Self::populate_packet(&mut packet, dest, &data)?;
         Ok(packet)
     }
@@ -170,9 +169,9 @@ impl fmt::Debug for Packet {
 
 #[allow(clippy::uninit_assumed_init)]
 impl Default for Packet {
-    fn default() -> Packet {
+    fn default() -> Self {
         let buffer = std::mem::MaybeUninit::<[u8; PACKET_DATA_SIZE]>::uninit();
-        Packet {
+        Self {
             buffer: unsafe { buffer.assume_init() },
             meta: Meta::default(),
         }
@@ -180,7 +179,7 @@ impl Default for Packet {
 }
 
 impl PartialEq for Packet {
-    fn eq(&self, other: &Packet) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self.meta() == other.meta() && self.data(..) == other.data(..)
     }
 }
@@ -243,7 +242,6 @@ impl Default for Meta {
             addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 0,
             flags: PacketFlags::empty(),
-            sender_stake: 0,
         }
     }
 }

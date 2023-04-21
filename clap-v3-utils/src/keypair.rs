@@ -18,6 +18,9 @@ use {
     bip39::{Language, Mnemonic, Seed},
     clap::ArgMatches,
     rpassword::prompt_password,
+    solana_remote_keypair::openpgp_card::{
+        Locator as OpenpgpCardLocator, LocatorError as OpenpgpCardLocatorError, OpenpgpCard,
+    },
     solana_remote_wallet::{
         locator::{Locator as RemoteWalletLocator, LocatorError as RemoteWalletLocatorError},
         remote_keypair::generate_remote_keypair,
@@ -29,9 +32,8 @@ use {
         message::Message,
         pubkey::Pubkey,
         signature::{
-            generate_seed_from_seed_phrase_and_passphrase, keypair_from_seed,
-            keypair_from_seed_and_derivation_path, keypair_from_seed_phrase_and_passphrase,
-            read_keypair, read_keypair_file, Keypair, NullSigner, Presigner, Signature, Signer,
+            generate_seed_from_seed_phrase_and_passphrase, read_keypair, read_keypair_file,
+            EncodableKey, Keypair, NullSigner, Presigner, Signature, Signer,
         },
     },
     std::{
@@ -173,13 +175,13 @@ impl DefaultSigner {
                         Ok(())
                     }
                 })
-                .map_err(|_| {
+                .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!(
-                        "No default signer found, run \"solana-keygen new -o {}\" to create a new one",
-                        self.path
-                    ),
+                            "Could not find default signer: {}. Run \"solana-keygen new -o {}\" to create a new one.",
+                            e, self.path
+                        ),
                     )
                 })?;
             *self.is_path_checked.borrow_mut() = true;
@@ -399,6 +401,7 @@ const SIGNER_SOURCE_FILEPATH: &str = "file";
 const SIGNER_SOURCE_USB: &str = "usb";
 const SIGNER_SOURCE_STDIN: &str = "stdin";
 const SIGNER_SOURCE_PUBKEY: &str = "pubkey";
+const SIGNER_SOURCE_PGPCARD: &str = "pgpcard";
 
 pub(crate) enum SignerSourceKind {
     Prompt,
@@ -406,6 +409,7 @@ pub(crate) enum SignerSourceKind {
     Usb(RemoteWalletLocator),
     Stdin,
     Pubkey(Pubkey),
+    Pgpcard(OpenpgpCardLocator),
 }
 
 impl AsRef<str> for SignerSourceKind {
@@ -416,6 +420,7 @@ impl AsRef<str> for SignerSourceKind {
             Self::Usb(_) => SIGNER_SOURCE_USB,
             Self::Stdin => SIGNER_SOURCE_STDIN,
             Self::Pubkey(_) => SIGNER_SOURCE_PUBKEY,
+            Self::Pgpcard(_) => SIGNER_SOURCE_PGPCARD,
         }
     }
 }
@@ -437,6 +442,8 @@ pub(crate) enum SignerSourceError {
     DerivationPathError(#[from] DerivationPathError),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    OpenpgpCardLocatorError(#[from] OpenpgpCardLocatorError),
 }
 
 pub(crate) fn parse_signer_source<S: AsRef<str>>(
@@ -482,6 +489,9 @@ pub(crate) fn parse_signer_source<S: AsRef<str>>(
                         legacy: false,
                     }),
                     SIGNER_SOURCE_STDIN => Ok(SignerSource::new(SignerSourceKind::Stdin)),
+                    SIGNER_SOURCE_PGPCARD => Ok(SignerSource::new(SignerSourceKind::Pgpcard(
+                        OpenpgpCardLocator::try_from(&uri)?,
+                    ))),
                     _ => {
                         #[cfg(target_family = "windows")]
                         // On Windows, an absolute path's drive letter will be parsed as the URI
@@ -616,6 +626,20 @@ pub struct SignerFromPathConfig {
 ///   - `usb://ledger?key=0/0`
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd`
 ///   - `usb://ledger/9rPVSygg3brqghvdZ6wsL2i5YNQTGhXGdJzF65YxaCQd?key=0/0`
+///
+/// - `pgpcard:` &mdash; Use a connected OpenPGP smart card as the signer.
+///   In particular, use the key in the signing slot of the OpenPGP application
+///   on the card.
+///
+///   The URI host is the 16-byte OpenPGP AID in its standard hexadecimal form
+///   (32 digits). (For details, see section 4.2.1 of the
+///   [OpenPGP specification][pgpspec].) The URI host may also be omitted, in
+///   which case the first connected smart card that is found is used.
+///
+///   Examples:
+///
+///   - `pgpcard://`
+///   - `pgpcard://D2760001240103040006123456780000`
 ///
 /// Next the `path` argument may be one of the following strings:
 ///
@@ -816,6 +840,9 @@ pub fn signer_from_path_with_config(
                 .into())
             }
         }
+        SignerSourceKind::Pgpcard(locator) => {
+            Ok(Box::new(OpenpgpCard::try_from(&locator)?))
+        }
     }
 }
 
@@ -1000,6 +1027,30 @@ pub fn keypair_from_path(
     keypair_name: &str,
     confirm_pubkey: bool,
 ) -> Result<Keypair, Box<dyn error::Error>> {
+    let keypair = encodable_key_from_path(matches, path, keypair_name)?;
+    if confirm_pubkey {
+        confirm_keypair_pubkey(&keypair);
+    }
+    Ok(keypair)
+}
+
+fn confirm_keypair_pubkey(keypair: &Keypair) {
+    let pubkey = keypair.pubkey();
+    print!("Recovered pubkey `{pubkey:?}`. Continue? (y/n): ");
+    let _ignored = stdout().flush();
+    let mut input = String::new();
+    stdin().read_line(&mut input).expect("Unexpected input");
+    if input.to_lowercase().trim() != "y" {
+        println!("Exiting");
+        exit(1);
+    }
+}
+
+fn encodable_key_from_path<K: EncodableKey>(
+    matches: &ArgMatches,
+    path: &str,
+    keypair_name: &str,
+) -> Result<K, Box<dyn error::Error>> {
     let SignerSource {
         kind,
         derivation_path,
@@ -1008,15 +1059,14 @@ pub fn keypair_from_path(
     match kind {
         SignerSourceKind::Prompt => {
             let skip_validation = matches.is_present(SKIP_SEED_PHRASE_VALIDATION_ARG.name);
-            Ok(keypair_from_seed_phrase(
+            Ok(encodable_key_from_seed_phrase(
                 keypair_name,
                 skip_validation,
-                confirm_pubkey,
                 derivation_path,
                 legacy,
             )?)
         }
-        SignerSourceKind::Filepath(path) => match read_keypair_file(&path) {
+        SignerSourceKind::Filepath(path) => match K::read_from_file(&path) {
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!(
@@ -1029,7 +1079,7 @@ pub fn keypair_from_path(
         },
         SignerSourceKind::Stdin => {
             let mut stdin = std::io::stdin();
-            Ok(read_keypair(&mut stdin)?)
+            Ok(K::read(&mut stdin)?)
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -1050,19 +1100,33 @@ pub fn keypair_from_seed_phrase(
     derivation_path: Option<DerivationPath>,
     legacy: bool,
 ) -> Result<Keypair, Box<dyn error::Error>> {
-    let seed_phrase = prompt_password(format!("[{keypair_name}] seed phrase: "))?;
+    let keypair: Keypair =
+        encodable_key_from_seed_phrase(keypair_name, skip_validation, derivation_path, legacy)?;
+    if confirm_pubkey {
+        confirm_keypair_pubkey(&keypair);
+    }
+    Ok(keypair)
+}
+
+fn encodable_key_from_seed_phrase<K: EncodableKey>(
+    key_name: &str,
+    skip_validation: bool,
+    derivation_path: Option<DerivationPath>,
+    legacy: bool,
+) -> Result<K, Box<dyn error::Error>> {
+    let seed_phrase = prompt_password(format!("[{key_name}] seed phrase: "))?;
     let seed_phrase = seed_phrase.trim();
     let passphrase_prompt = format!(
-        "[{keypair_name}] If this seed phrase has an associated passphrase, enter it now. Otherwise, press ENTER to continue: ",
+        "[{key_name}] If this seed phrase has an associated passphrase, enter it now. Otherwise, press ENTER to continue: ",
     );
 
-    let keypair = if skip_validation {
+    let key = if skip_validation {
         let passphrase = prompt_passphrase(&passphrase_prompt)?;
         if legacy {
-            keypair_from_seed_phrase_and_passphrase(seed_phrase, &passphrase)?
+            K::from_seed_phrase_and_passphrase(seed_phrase, &passphrase)?
         } else {
             let seed = generate_seed_from_seed_phrase_and_passphrase(seed_phrase, &passphrase);
-            keypair_from_seed_and_derivation_path(&seed, derivation_path)?
+            K::from_seed_and_derivation_path(&seed, derivation_path)?
         }
     } else {
         let sanitized = sanitize_seed_phrase(seed_phrase);
@@ -1087,25 +1151,12 @@ pub fn keypair_from_seed_phrase(
         let passphrase = prompt_passphrase(&passphrase_prompt)?;
         let seed = Seed::new(&mnemonic, &passphrase);
         if legacy {
-            keypair_from_seed(seed.as_bytes())?
+            K::from_seed(seed.as_bytes())?
         } else {
-            keypair_from_seed_and_derivation_path(seed.as_bytes(), derivation_path)?
+            K::from_seed_and_derivation_path(seed.as_bytes(), derivation_path)?
         }
     };
-
-    if confirm_pubkey {
-        let pubkey = keypair.pubkey();
-        print!("Recovered pubkey `{pubkey:?}`. Continue? (y/n): ");
-        let _ignored = stdout().flush();
-        let mut input = String::new();
-        stdin().read_line(&mut input).expect("Unexpected input");
-        if input.to_lowercase().trim() != "y" {
-            println!("Exiting");
-            exit(1);
-        }
-    }
-
-    Ok(keypair)
+    Ok(key)
 }
 
 fn sanitize_seed_phrase(seed_phrase: &str) -> String {
@@ -1121,6 +1172,7 @@ mod tests {
         super::*,
         crate::offline::OfflineArgs,
         clap::{Arg, Command},
+        openpgp_card::card_do::ApplicationIdentifier,
         solana_remote_wallet::{locator::Manufacturer, remote_wallet::initialize_wallet_manager},
         solana_sdk::{signer::keypair::write_keypair_file, system_instruction},
         tempfile::{NamedTempFile, TempDir},
@@ -1230,6 +1282,7 @@ mod tests {
             } if p == relative_path_str)
         );
 
+        // ledger signer source tests
         let usb = "usb://ledger".to_string();
         let expected_locator = RemoteWalletLocator {
             manufacturer: Manufacturer::Ledger,
@@ -1251,6 +1304,37 @@ mod tests {
                 derivation_path: d,
                 legacy: false,
             } if u == expected_locator && d == expected_derivation_path));
+
+        // pgpcard signer source tests
+        let pgpcard = "pgpcard://".to_string();
+        let expected_locator = OpenpgpCardLocator { aid: None };
+        assert!(
+            matches!(parse_signer_source(pgpcard).unwrap(), SignerSource {
+                kind: SignerSourceKind::Pgpcard(p),
+                derivation_path: None,
+                legacy: false,
+            } if p == expected_locator)
+        );
+        let pgpcard = "pgpcard://D2760001240103040006123456780000".to_string();
+        let expected_ident_bytes: [u8; 16] = [
+            0xD2, 0x76, 0x00, 0x01, 0x24, // preamble
+            0x01, // application id (OpenPGP)
+            0x03, 0x04, // version
+            0x00, 0x06, // manufacturer id
+            0x12, 0x34, 0x56, 0x78, // serial number
+            0x00, 0x00, // reserved
+        ];
+        let expected_locator = OpenpgpCardLocator {
+            aid: Some(ApplicationIdentifier::try_from(&expected_ident_bytes[..]).unwrap()),
+        };
+        assert!(
+            matches!(parse_signer_source(pgpcard).unwrap(), SignerSource {
+                kind: SignerSourceKind::Pgpcard(p),
+                derivation_path: None,
+                legacy: false,
+            } if p == expected_locator)
+        );
+
         // Catchall into SignerSource::Filepath fails
         let junk = "sometextthatisnotapubkeyorfile".to_string();
         assert!(Pubkey::from_str(&junk).is_err());
